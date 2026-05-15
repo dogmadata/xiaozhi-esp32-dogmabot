@@ -1,0 +1,58 @@
+name: Release
+
+# Builds the boards shipped by this fork and attaches the release zips to
+# the corresponding GitHub Release. The upstream `build.yml` workflow runs
+# the per-PR matrix; this one only fires on release tags.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish to (must already exist as a GitHub Release)"
+        required: true
+
+permissions:
+  contents: write   # needed to upload assets to the GitHub Release
+
+jobs:
+  build:
+    name: Build ${{ matrix.full_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: sp-esp32-s3-1.28-box
+            name: sp-esp32-s3-1.28-box
+            full_name: sp-esp32-s3-1.28-box
+          - board: waveshare/esp32-s3-rlcd-4.2
+            name: esp32-s3-rlcd-4.2
+            full_name: waveshare-esp32-s3-rlcd-4.2
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build current variant
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          python scripts/release.py ${{ matrix.board }} --name ${{ matrix.name }}
+
+      - name: Upload artifact (CI retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaozhi_${{ matrix.full_name }}_${{ github.sha }}
+          path: releases/*.zip
+          if-no-files-found: error
+
+      - name: Attach zip to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name != '' && github.ref_name || inputs.tag }}
+          files: releases/*.zip
+          fail_on_unmatched_files: true
