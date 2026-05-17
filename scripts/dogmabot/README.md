@@ -128,10 +128,10 @@ customizados (hoje `sp-esp32-s3-1.28-box` e
 `waveshare/esp32-s3-rlcd-4.2`) e anexa os zips `v{ver}_{board}.zip`
 em uma GitHub Release sempre que uma tag `v*` é empurrada.
 
-Procedimento a partir do branch `feat/dogmabot-customizations`:
+Procedimento a partir do branch `dogmabot`:
 
 ```bash
-git checkout feat/dogmabot-customizations
+git checkout dogmabot
 git pull --rebase
 git tag v2.2.6
 git push origin v2.2.6
