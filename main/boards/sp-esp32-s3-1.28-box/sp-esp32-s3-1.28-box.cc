@@ -202,9 +202,15 @@ public:
         lv_obj_set_style_text_font(battery_label_, icon_font, 0);
         lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
 
-        // Emoji image + AI-logo fallback, centered.
+        // Emoji image + AI-logo fallback, centered. The emoji collection
+        // ships at 64 px (twemoji_64); we scale it up at render time so the
+        // face fills more of the inscribed safe area without retouching
+        // the assets. 384/256 = 1.5x → 96 px on screen, still leaving a
+        // gap to the chat box at center+64.
+        constexpr int32_t kEmojiZoom = 384;  // LV_SCALE_NONE == 256
         emoji_image_ = lv_image_create(screen);
         lv_obj_center(emoji_image_);
+        lv_image_set_scale(emoji_image_, kEmojiZoom);
         lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
         emoji_label_ = lv_label_create(screen);
@@ -281,11 +287,13 @@ public:
         // override SetChatMessage below to write to chat_message_label_ directly.
     }
 
-    // Show the last assistant/user message in the chat pill below the emoji.
-    // Long content scrolls horizontally (CIRCULAR marquee). While the pill is
-    // visible we hide the bottom status_label_ so the clock/state doesn't
-    // overlap or compete with the transcript.
-    virtual void SetChatMessage(const char* role, const char* content) override {
+    // Show the last assistant/user/system message in the chat pill below the
+    // emoji. Long content scrolls horizontally (CIRCULAR marquee). While the
+    // pill is visible we hide status_label_ so the clock/state doesn't
+    // compete with the transcript. We deliberately accept role "system" —
+    // the upstream firmware sends critical adoption/activation messages and
+    // alerts under that role (see Application::Alert and ShowActivationCode).
+    virtual void SetChatMessage(const char* /*role*/, const char* content) override {
         if (chat_box_ == nullptr || chat_message_label_ == nullptr) return;
         DisplayLockGuard lock(this);
 
@@ -298,10 +306,6 @@ public:
                 lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
             }
             return;
-        }
-
-        if (role != nullptr && strcmp(role, "system") == 0) {
-            return;  // system messages stay off-screen on the round UI
         }
 
         if (status_label_ != nullptr) {

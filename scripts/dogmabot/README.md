@@ -21,6 +21,9 @@ Grava o `merged-binary.bin` (zip do release CI ou build local) na placa.
 
 # Forçar porta / baud / abrir monitor após gravar:
 .\flash.ps1 -Port COM7 -Baud 921600 -Monitor
+
+# Gravar APENAS a partição da app (xiaozhi.bin em 0x20000):
+.\flash.ps1 -AppOnly
 ```
 
 Ordem de auto-descoberta (mais recente vence):
@@ -33,6 +36,55 @@ Ordem de auto-descoberta (mais recente vence):
 
 Requisitos: Python 3 no PATH. O script instala `esptool` via `pip
 install --user` na primeira vez se faltar.
+
+### `-AppOnly` — gravação rápida (só a partição da app)
+
+Por padrão o script grava o `merged-binary.bin`, que cobre todas as
+partições (bootloader, partition-table, ota_data, app, assets) a
+partir de `0x0` — ~9 MB. Com `-AppOnly`, grava apenas o
+`xiaozhi.bin` (~2.8 MB) diretamente em `0x20000` (`ota_0`):
+
+```powershell
+# Pega build/xiaozhi.bin do build local:
+.\flash.ps1 -AppOnly
+
+# Combinável com -Port e -Monitor:
+.\flash.ps1 -AppOnly -Port COM7 -Monitor
+
+# Caminho explícito (útil se o .bin estiver fora de build/):
+.\flash.ps1 -AppOnly -Bin C:\path\to\xiaozhi.bin
+```
+
+**Quando usar:**
+
+- Iteração no código C++ / UI / configs de partição **app**. ~3× mais
+  rápido que o full flash.
+
+**Quando NÃO usar:**
+
+- Mudou conteúdo da partição **assets** (`main/assets/`, GIFs,
+  fontes, wake-word, locale): você precisa regravar o
+  `generated_assets.bin` em `0x800000`, então faça flash normal
+  (sem `-AppOnly`).
+- Mudou o **layout de partições** (`partitions/v2/*.csv`) ou o
+  **bootloader**: full flash + `-Erase`.
+- Quer **preservar a senha do Wi-Fi e o claim do device**:
+  `-AppOnly` preserva a partição NVS em `0x9000` (full flash
+  zera a NVS porque o `merge_bin -f raw` preenche o gap entre
+  partition-table e `ota_data` com `0xFF`).
+- Device foi atualizado via OTA e está rodando do slot `ota_1`:
+  `-AppOnly` grava em `ota_0`, então o boot continua no slot antigo.
+  Solução: rodar full flash uma vez para resetar `ota_data` para
+  `ota_0`.
+
+**Limitações:**
+
+- Não funciona com zip de release — esse contém só o
+  `merged-binary.bin`, e fatiar a partição app dele exigiria
+  parsear a tabela de partições. Use **build local**
+  (`idf.py build` → produz `build/xiaozhi.bin`).
+- A flag `-Erase` é ignorada em modo `-AppOnly` (faz sentido só
+  no full flash).
 
 ## `serial-log.ps1`
 
