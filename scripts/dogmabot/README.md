@@ -123,6 +123,10 @@ do Windows antes de rodar os scripts.
 
 ## Publicando um release (CI → GitHub Release → DogmaBotServer)
 
+> Documentação completa do pipeline (incluindo adicionar boards
+> novos, mergear upstream, reverter releases ruins): veja
+> [`docs/dogmabot-release.md`](../../docs/dogmabot-release.md).
+
 O workflow `.github/workflows/release.yml` builda os boards
 customizados (hoje `sp-esp32-s3-1.28-box` e
 `waveshare/esp32-s3-rlcd-4.2`) e anexa os zips `v{ver}_{board}.zip`
