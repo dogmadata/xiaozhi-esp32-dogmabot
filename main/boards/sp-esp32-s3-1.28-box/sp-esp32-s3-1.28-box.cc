@@ -202,15 +202,11 @@ public:
         lv_obj_set_style_text_font(battery_label_, icon_font, 0);
         lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
 
-        // Emoji image + AI-logo fallback, centered. The emoji collection
-        // ships at 64 px (twemoji_64); we scale it up at render time so the
-        // face fills more of the inscribed safe area without retouching
-        // the assets. 384/256 = 1.5x → 96 px on screen, still leaving a
-        // gap to the chat box at center+64.
-        constexpr int32_t kEmojiZoom = 384;  // LV_SCALE_NONE == 256
+        // Emoji image + AI-logo fallback, centered. Rendered at the asset's
+        // native resolution (twemoji_64 → 64×64) — scaling up looked blurry,
+        // so we keep the source-resolution pixels.
         emoji_image_ = lv_image_create(screen);
         lv_obj_center(emoji_image_);
-        lv_image_set_scale(emoji_image_, kEmojiZoom);
         lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
 
         emoji_label_ = lv_label_create(screen);
