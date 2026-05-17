@@ -1,8 +1,12 @@
 # Captura log serial do ESP32 em arquivo + tela.
+# O log vai por padrao para o diretorio onde voce executou o script (cwd),
+# nao para a pasta do proprio script — assim nao polui o repo.
+#
 # Uso:
-#   .\serial-log.ps1                  # detecta COM, grava em serial-YYYYMMDD-HHmmss.log
+#   .\serial-log.ps1                                  # detecta COM, log na cwd
 #   .\serial-log.ps1 -Port COM7
-#   .\serial-log.ps1 -Reset           # pulsa DTR/RTS para resetar o device antes
+#   .\serial-log.ps1 -Reset                           # pulsa DTR/RTS antes
+#   .\serial-log.ps1 -LogFile C:\logs\boot.txt
 # Ctrl+C para parar.
 
 [CmdletBinding()]
@@ -14,7 +18,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Location -Path $PSScriptRoot
 
 function Get-EspPorts {
     $known = @{
@@ -52,8 +55,18 @@ function Select-Port {
 }
 
 if (-not $Port) { $Port = Select-Port }
-if (-not $LogFile) { $LogFile = "serial-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date) }
-$LogFile = Join-Path $PSScriptRoot $LogFile
+if (-not $LogFile) {
+    $LogFile = "serial-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date)
+}
+# Relative paths resolve against the user's cwd, not $PSScriptRoot.
+# Use ProviderPath — (Get-Location).Path can include the "FileSystem::" provider
+# prefix in some shells, which StreamWriter rejects with NotSupportedException.
+if (-not [System.IO.Path]::IsPathRooted($LogFile)) {
+    $cwd = $PWD.ProviderPath
+    if (-not $cwd) { $cwd = [Environment]::CurrentDirectory }
+    $LogFile = Join-Path $cwd $LogFile
+}
+$LogFile = [System.IO.Path]::GetFullPath($LogFile)
 
 Write-Host "Porta: $Port @ $Baud  Log: $LogFile" -ForegroundColor Green
 Write-Host "Ctrl+C para parar." -ForegroundColor Yellow
@@ -66,14 +79,12 @@ $sp.RtsEnable = $false
 $sp.Open()
 
 if ($Reset) {
-    # ESP32 hard reset: pulse EN low via DTR (or RTS, depending on board) for ~50ms
     Write-Host "Resetando device..." -ForegroundColor Cyan
     $sp.DtrEnable = $true; $sp.RtsEnable = $true
     Start-Sleep -Milliseconds 50
     $sp.DtrEnable = $false; $sp.RtsEnable = $false
 }
 
-# Escreve header no log
 "=== $(Get-Date -Format o) | $Port @ $Baud ===" | Out-File -FilePath $LogFile -Encoding utf8
 
 try {

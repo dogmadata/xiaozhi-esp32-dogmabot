@@ -1,11 +1,17 @@
 #include "wifi_board.h"
 #include "codecs/es8311_audio_codec.h"
 #include "display/lcd_display.h"
+#include "lvgl_theme.h"
 #include "application.h"
+#include "board.h"
 #include "button.h"
 #include "config.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
+#include "audio/audio_codec.h"
+#include <cstring>
+#include <ctime>
+#include <font_awesome.h>
 #include <esp_log.h>
 #include <esp_efuse_table.h>
 #include <driver/i2c_master.h>
@@ -103,6 +109,22 @@ private:
 };
 
 
+// Round-display UI for the 240x240 GC9A01. The upstream SpiLcdDisplay layout
+// assumes a rectangular screen; on this board the corners get clipped by the
+// circular bezel. We build a different widget tree here, reusing the same
+// protected member pointers from LvglDisplay/LcdDisplay so the base classes'
+// SetStatus/UpdateStatusBar/SetEmotion/ShowNotification all keep working.
+//
+// Side arc geometry: two arcs of kArcSpanDeg each, leaving a kArcGapDeg gap
+// at 12h and another at 6h. With the gap at 20°, each arc covers 160°; their
+// midpoints sit on the horizontal axis (3h / 9h). Right arc = battery, left
+// arc = volume.
+constexpr int kArcGapDeg = 20;
+constexpr int kArcSpanDeg = 180 - kArcGapDeg;          // 160
+constexpr int kArcHalfSpanDeg = kArcSpanDeg / 2;       // 80
+constexpr int kRightArcRotation = 270 + kArcGapDeg / 2; // 280 (10° past top, CW)
+constexpr int kLeftArcRotation  =  90 + kArcGapDeg / 2; // 100 (10° past bottom, CW)
+
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
     CustomLcdDisplay(esp_lcd_panel_io_handle_t io_handle,
@@ -115,19 +137,336 @@ public:
                     bool mirror_y,
                     bool swap_xy)
         : SpiLcdDisplay(io_handle, panel_handle, width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
-        // Note: UI customization should be done in SetupUI(), not in constructor
-        // to ensure lvgl objects are created before accessing them
     }
 
     virtual void SetupUI() override {
-        // Call parent SetupUI() first to create all lvgl objects
-        SpiLcdDisplay::SetupUI();
+        Display::SetupUI();  // marks setup_ui_called_; does NOT call SpiLcdDisplay::SetupUI
 
         DisplayLockGuard lock(this);
-        // 由于屏幕是圆的，所以状态栏需要增加左右内边距
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.33, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.33, 0);
+        auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
+        auto text_font = lvgl_theme->text_font()->font();
+        auto icon_font = lvgl_theme->icon_font()->font();
+        auto large_icon_font = lvgl_theme->large_icon_font()->font();
+
+        auto screen = lv_screen_active();
+        lv_obj_set_style_text_font(screen, text_font, 0);
+        lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+
+        // Side arcs — symmetric on the left and right of the circle. Each
+        // spans kArcSpanDeg centered on the horizontal axis (3h / 9h), with
+        // 20° gaps at 12h and 6h. The right arc reports battery level; the
+        // left arc reports volume. Both shrink from their midpoint outward
+        // (see UpdateStatusBar). The bg track is tinted with the theme's
+        // text color so it reads on both light and dark themes.
+        battery_arc_right_ = MakeRimArc(screen, kRightArcRotation, kArcSpanDeg);
+        volume_arc_left_   = MakeRimArc(screen, kLeftArcRotation,  kArcSpanDeg);
+        StyleArcBackground(battery_arc_right_, lvgl_theme);
+        StyleArcBackground(volume_arc_left_,   lvgl_theme);
+
+        // Top row — WiFi icon + clock, centered horizontally in the gap above
+        // the side arcs. y = 22 keeps the row clear of the arc endpoints that
+        // reach down to ~y = 11 at the rim.
+        top_bar_ = lv_obj_create(screen);
+        lv_obj_set_size(top_bar_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_align(top_bar_, LV_ALIGN_TOP_MID, 0, 22);
+        lv_obj_set_style_bg_opa(top_bar_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(top_bar_, 0, 0);
+        lv_obj_set_style_pad_all(top_bar_, 0, 0);
+        lv_obj_set_flex_flow(top_bar_, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(top_bar_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_scrollbar_mode(top_bar_, LV_SCROLLBAR_MODE_OFF);
+
+        network_label_ = lv_label_create(top_bar_);
+        lv_label_set_text(network_label_, "");
+        lv_obj_set_style_text_font(network_label_, icon_font, 0);
+        lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0);
+
+        clock_label_ = lv_label_create(top_bar_);
+        lv_label_set_text(clock_label_, "--:--");
+        lv_obj_set_style_text_color(clock_label_, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_margin_left(clock_label_, lvgl_theme->spacing(2), 0);
+
+        // Side icons — pushed out toward the arcs so they read as one unit
+        // with the matching rim arc. With the icon ~16 px wide and the inner
+        // arc edge near x=8 on each side, x=±15 leaves a small gap.
+        mute_label_ = lv_label_create(screen);
+        lv_label_set_text(mute_label_, FONT_AWESOME_VOLUME_HIGH);
+        lv_obj_align(mute_label_, LV_ALIGN_LEFT_MID, 15, 0);
+        lv_obj_set_style_text_font(mute_label_, icon_font, 0);
+        lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
+
+        battery_label_ = lv_label_create(screen);
+        lv_label_set_text(battery_label_, "");
+        lv_obj_align(battery_label_, LV_ALIGN_RIGHT_MID, -15, 0);
+        lv_obj_set_style_text_font(battery_label_, icon_font, 0);
+        lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
+
+        // Emoji image + AI-logo fallback, centered.
+        emoji_image_ = lv_image_create(screen);
+        lv_obj_center(emoji_image_);
+        lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+
+        emoji_label_ = lv_label_create(screen);
+        lv_obj_center(emoji_label_);
+        lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
+        lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+        lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
+
+        // Device state ("Listening...", "Speaking...", etc.) sits between
+        // the top row and the emoji. Notification reuses the same anchor so
+        // it covers the state text when it fires.
+        status_label_ = lv_label_create(screen);
+        lv_obj_set_size(status_label_, 180, 22);
+        lv_obj_align(status_label_, LV_ALIGN_TOP_MID, 0, 58);
+        lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
+        lv_label_set_long_mode(status_label_, LV_LABEL_LONG_DOT);
+        lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
+
+        notification_label_ = lv_label_create(screen);
+        lv_obj_set_size(notification_label_, 180, 28);
+        lv_obj_align(notification_label_, LV_ALIGN_TOP_MID, 0, 56);
+        lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_bg_color(notification_label_, lvgl_theme->user_bubble_color(), 0);
+        lv_obj_set_style_bg_opa(notification_label_, LV_OPA_70, 0);
+        lv_obj_set_style_radius(notification_label_, 12, 0);
+        lv_obj_set_style_pad_all(notification_label_, lvgl_theme->spacing(2), 0);
+        lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_DOT);
+        lv_label_set_text(notification_label_, "");
+        lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+
+        // Chat marquee — small rounded box just below the emoji that scrolls
+        // long transcripts horizontally. Uses inverted theme colors so the
+        // pill stands out against the screen background.
+        chat_box_ = lv_obj_create(screen);
+        lv_obj_set_size(chat_box_, 196, 30);
+        lv_obj_align(chat_box_, LV_ALIGN_CENTER, 0, 64);
+        lv_obj_set_style_radius(chat_box_, 8, 0);
+        lv_obj_set_style_bg_color(chat_box_, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_bg_opa(chat_box_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(chat_box_, 0, 0);
+        lv_obj_set_style_pad_hor(chat_box_, lvgl_theme->spacing(3), 0);
+        lv_obj_set_style_pad_ver(chat_box_, 0, 0);
+        lv_obj_set_scrollbar_mode(chat_box_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(chat_box_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(chat_box_, LV_OBJ_FLAG_HIDDEN);
+
+        chat_message_label_ = lv_label_create(chat_box_);
+        lv_obj_set_width(chat_message_label_, lv_pct(100));
+        lv_obj_center(chat_message_label_);
+        lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->background_color(), 0);
+        lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_label_set_text(chat_message_label_, "");
+
+        // Low-battery popup, same role as the base layout — sits above the
+        // bottom band so it stays readable when something else is showing.
+        low_battery_popup_ = lv_obj_create(screen);
+        lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_size(low_battery_popup_, 180, 40);
+        lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -92);
+        lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
+        lv_obj_set_style_radius(low_battery_popup_, 12, 0);
+        lv_obj_set_style_border_width(low_battery_popup_, 0, 0);
+        low_battery_label_ = lv_label_create(low_battery_popup_);
+        lv_label_set_text(low_battery_label_, Lang::Strings::BATTERY_NEED_CHARGE);
+        lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
+        lv_obj_center(low_battery_label_);
+        lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
+
+        // container_/content_ are intentionally left nullptr — base
+        // LcdDisplay::SetChatMessage early-returns on null content_, and we
+        // override SetChatMessage below to write to chat_message_label_ directly.
     }
+
+    // Show the last assistant/user message in the chat pill below the emoji.
+    // Long content scrolls horizontally (CIRCULAR marquee). While the pill is
+    // visible we hide the bottom status_label_ so the clock/state doesn't
+    // overlap or compete with the transcript.
+    virtual void SetChatMessage(const char* role, const char* content) override {
+        if (chat_box_ == nullptr || chat_message_label_ == nullptr) return;
+        DisplayLockGuard lock(this);
+
+        if (content == nullptr || strlen(content) == 0) {
+            lv_label_set_text(chat_message_label_, "");
+            lv_obj_add_flag(chat_box_, LV_OBJ_FLAG_HIDDEN);
+            if (status_label_ != nullptr &&
+                (notification_label_ == nullptr ||
+                 lv_obj_has_flag(notification_label_, LV_OBJ_FLAG_HIDDEN))) {
+                lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+            return;
+        }
+
+        if (role != nullptr && strcmp(role, "system") == 0) {
+            return;  // system messages stay off-screen on the round UI
+        }
+
+        if (status_label_ != nullptr) {
+            lv_obj_add_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_label_set_text(chat_message_label_, content);
+        lv_obj_remove_flag(chat_box_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // The base LcdDisplay::SetTheme assumes container_/top_bar_/bottom_bar_/etc.
+    // exist (it dereferences container_ unconditionally). We left container_
+    // null on purpose, so reimplement SetTheme against the widget tree we
+    // actually created in SetupUI.
+    virtual void SetTheme(Theme* theme) override {
+        DisplayLockGuard lock(this);
+        auto lvgl_theme = static_cast<LvglTheme*>(theme);
+        auto screen = lv_screen_active();
+        auto text_font = lvgl_theme->text_font()->font();
+        auto icon_font = lvgl_theme->icon_font()->font();
+        auto large_icon_font = lvgl_theme->large_icon_font()->font();
+        auto chosen_icon_font = (text_font->line_height >= 40) ? large_icon_font : icon_font;
+
+        lv_obj_set_style_text_font(screen, text_font, 0);
+        lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
+        lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+
+        if (mute_label_)        { lv_obj_set_style_text_font(mute_label_, chosen_icon_font, 0);
+                                  lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0); }
+        if (battery_label_)     { lv_obj_set_style_text_font(battery_label_, chosen_icon_font, 0);
+                                  lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0); }
+        if (network_label_)     { lv_obj_set_style_text_font(network_label_, chosen_icon_font, 0);
+                                  lv_obj_set_style_text_color(network_label_, lvgl_theme->text_color(), 0); }
+        if (status_label_)       lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
+        if (clock_label_)        lv_obj_set_style_text_color(clock_label_, lvgl_theme->text_color(), 0);
+        if (chat_box_)           lv_obj_set_style_bg_color(chat_box_, lvgl_theme->text_color(), 0);
+        if (chat_message_label_) lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->background_color(), 0);
+        if (notification_label_) {
+            lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
+            lv_obj_set_style_bg_color(notification_label_, lvgl_theme->user_bubble_color(), 0);
+        }
+        if (emoji_label_)        lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
+        if (low_battery_popup_)  lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
+        StyleArcBackground(battery_arc_right_, lvgl_theme);
+        StyleArcBackground(volume_arc_left_,   lvgl_theme);
+
+        Display::SetTheme(lvgl_theme);  // persists the theme name to NVS
+    }
+
+    virtual void ClearChatMessages() override {
+        if (chat_box_ == nullptr) return;
+        DisplayLockGuard lock(this);
+        if (chat_message_label_ != nullptr) lv_label_set_text(chat_message_label_, "");
+        lv_obj_add_flag(chat_box_, LV_OBJ_FLAG_HIDDEN);
+        if (status_label_ != nullptr &&
+            (notification_label_ == nullptr ||
+             lv_obj_has_flag(notification_label_, LV_OBJ_FLAG_HIDDEN))) {
+            lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    // Drive the two rim arcs, the clock and the volume icon. The base
+    // LvglDisplay::UpdateStatusBar would otherwise overwrite status_label_
+    // with the time when the device is idle; here we suppress that and feed
+    // the time into a dedicated clock_label_ at the top instead.
+    virtual void UpdateStatusBar(bool update_all = false) override {
+        SpiLcdDisplay::UpdateStatusBar(update_all);
+
+        DisplayLockGuard lock(this);
+        auto& board = Board::GetInstance();
+        auto codec = board.GetAudioCodec();
+
+        // Clock at the top of the screen — always shows current time once
+        // the system clock is set.
+        if (clock_label_ != nullptr) {
+            time_t now = time(nullptr);
+            struct tm* tmv = localtime(&now);
+            if (tmv != nullptr && tmv->tm_year >= 2025 - 1900) {
+                char buf[16];
+                strftime(buf, sizeof(buf), "%H:%M", tmv);
+                lv_label_set_text(clock_label_, buf);
+            }
+        }
+
+        // If the device is idle, the base just wrote "HH:MM" into
+        // status_label_. We have a dedicated clock for that, so clear the
+        // status text in idle so the area stays free for the emoji.
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() == kDeviceStateIdle && status_label_ != nullptr) {
+            lv_label_set_text(status_label_, "");
+        }
+
+        // Volume icon: speaker-high when audible, speaker-x when muted.
+        if (mute_label_ != nullptr && codec != nullptr) {
+            const char* icon = (codec->output_volume() == 0)
+                ? FONT_AWESOME_VOLUME_XMARK
+                : FONT_AWESOME_VOLUME_HIGH;
+            lv_label_set_text(mute_label_, icon);
+        }
+
+        // Right arc — battery.
+        int level;
+        bool charging;
+        bool discharging;
+        if (board.GetBatteryLevel(level, charging, discharging) && battery_arc_right_ != nullptr) {
+            lv_color_t color;
+            if (charging)              color = lv_color_hex(0x33aaff);
+            else if (level <= 20)      color = lv_color_hex(0xcc4444);
+            else if (level <= 50)      color = lv_color_hex(0xddaa33);
+            else                       color = lv_color_hex(0x33aa55);
+            SetArcLevel(battery_arc_right_, level, color);
+        }
+
+        // Left arc — volume.
+        if (volume_arc_left_ != nullptr && codec != nullptr) {
+            int vol = codec->output_volume();
+            if (vol < 0)        vol = 0;
+            else if (vol > 100) vol = 100;
+            lv_color_t color = (vol == 0)
+                ? lv_color_hex(0x666666)              // muted = grey
+                : lv_color_hex(0x2288dd);             // audible = blue
+            SetArcLevel(volume_arc_left_, vol, color);
+        }
+    }
+
+private:
+    // Helper for constructing one of the rim arcs. The indicator is driven
+    // explicitly by lv_arc_set_angles — we don't rely on arc value/mode, so
+    // the helper just builds an empty arc collapsed at its midpoint.
+    static lv_obj_t* MakeRimArc(lv_obj_t* parent, int rotation_deg, int span_deg) {
+        lv_obj_t* arc = lv_arc_create(parent);
+        lv_obj_set_size(arc, 240, 240);
+        lv_obj_center(arc);
+        lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+        lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_arc_set_rotation(arc, rotation_deg);
+        lv_arc_set_bg_angles(arc, 0, span_deg);
+        lv_arc_set_angles(arc, span_deg / 2, span_deg / 2);  // collapsed
+        lv_obj_set_style_arc_width(arc, 8, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(arc, 8, LV_PART_INDICATOR);
+        lv_obj_add_flag(arc, LV_OBJ_FLAG_HIDDEN);
+        return arc;
+    }
+
+    // Bg-track color = theme text color at 30% opacity — gives a visible but
+    // muted track on both light (dark track on white) and dark (light track
+    // on black) themes.
+    static void StyleArcBackground(lv_obj_t* arc, LvglTheme* theme) {
+        if (arc == nullptr || theme == nullptr) return;
+        lv_obj_set_style_arc_color(arc, theme->text_color(), LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(arc, LV_OPA_30, LV_PART_MAIN);
+    }
+
+    // Drive a rim arc from a 0–100 level. The indicator grows symmetrically
+    // outward from the arc's midpoint.
+    static void SetArcLevel(lv_obj_t* arc, int level, lv_color_t color) {
+        int half = level * kArcHalfSpanDeg / 100;
+        lv_obj_remove_flag(arc, LV_OBJ_FLAG_HIDDEN);
+        lv_arc_set_angles(arc, kArcHalfSpanDeg - half, kArcHalfSpanDeg + half);
+        lv_obj_set_style_arc_color(arc, color, LV_PART_INDICATOR);
+    }
+
+    lv_obj_t* battery_arc_right_ = nullptr;
+    lv_obj_t* volume_arc_left_   = nullptr;
+    lv_obj_t* clock_label_       = nullptr;
+    lv_obj_t* chat_box_          = nullptr;
 };
 
 

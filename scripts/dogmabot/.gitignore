@@ -1,0 +1,6 @@
+# Logs gerados por serial-log.ps1 quando rodado a partir desta pasta.
+serial-*.log
+
+# Caso o usuário copie um .bin/.zip pra cá em vez de usar releases/ ou build/.
+merged-binary*.bin
+v*.zip
