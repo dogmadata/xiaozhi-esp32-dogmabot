@@ -1,13 +1,20 @@
 # Flash xiaozhi-esp32-dogmabot firmware via Windows PowerShell.
-# Auto-discovers the binary in this order:
+# Discovers candidate binaries from:
 #   1. -Bin <path>  (explicit; accepts .bin OR .zip release archive)
-#   2. <repoRoot>/releases/v*.zip  (latest by mtime — what CI produces)
+#   2. <repoRoot>/releases/v*.zip  (CI/release.py output)
 #   3. <repoRoot>/build/merged-binary.bin  (local IDF build)
 #   4. <cwd>/merged-binary.bin
 #   5. <cwd>/v*.zip
 #
+# When more than one candidate exists and -Bin is not given, you'll be
+# prompted to pick (Enter = newest). Use -Pick to force the prompt even
+# when only one candidate is found. Use -Latest to always take the
+# newest without prompting (old behavior).
+#
 # Usage:
-#   .\flash.ps1                                # full flash from latest zip/bin
+#   .\flash.ps1                                # interactive picker (if >1 candidate)
+#   .\flash.ps1 -Pick                          # force picker
+#   .\flash.ps1 -Latest                        # always take newest, no prompt
 #   .\flash.ps1 -AppOnly                       # flash ONLY app partition (build/xiaozhi.bin at 0x20000)
 #                                              # ~3x faster, only works with a local build
 #   .\flash.ps1 -Erase                         # erase whole flash first
@@ -22,7 +29,9 @@ param(
     [int]$Baud = 460800,
     [switch]$Erase,
     [switch]$Monitor,
-    [switch]$AppOnly
+    [switch]$AppOnly,
+    [switch]$Pick,
+    [switch]$Latest
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,31 +99,62 @@ function Find-Binary {
     }
 
     $candidates = @()
-    # 1. CI artifacts
     $relDir = Join-Path $RepoRoot "releases"
     if (Test-Path $relDir) {
-        $candidates += Get-ChildItem $relDir -Filter "v*.zip" -ErrorAction SilentlyContinue
+        foreach ($f in Get-ChildItem $relDir -Filter "v*.zip" -ErrorAction SilentlyContinue) {
+            $candidates += [pscustomobject]@{ Source="releases/"; File=$f }
+        }
     }
-    # 2. Local build
     $localBuild = Join-Path $RepoRoot "build\merged-binary.bin"
     if (Test-Path $localBuild) {
-        $candidates += Get-Item $localBuild
+        $candidates += [pscustomobject]@{ Source="build/  ";   File=Get-Item $localBuild }
     }
-    # 3. cwd fallbacks
     $cwd = $PWD.ProviderPath
     $cwdBin = Join-Path $cwd "merged-binary.bin"
-    if (Test-Path $cwdBin) { $candidates += Get-Item $cwdBin }
-    $candidates += Get-ChildItem $cwd -Filter "v*.zip" -ErrorAction SilentlyContinue
+    if (Test-Path $cwdBin) {
+        $candidates += [pscustomobject]@{ Source="cwd/    ";  File=Get-Item $cwdBin }
+    }
+    foreach ($f in Get-ChildItem $cwd -Filter "v*.zip" -ErrorAction SilentlyContinue) {
+        $candidates += [pscustomobject]@{ Source="cwd/    ";  File=$f }
+    }
 
-    $best = $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $best) {
+    if (-not $candidates) {
         Write-Host "Nao encontrei merged-binary.bin nem um zip de release." -ForegroundColor Red
         Write-Host "  Esperado em: $relDir, $localBuild, ou cwd." -ForegroundColor Yellow
         Write-Host "  Ou passe -Bin <caminho> explicitamente." -ForegroundColor Yellow
         exit 1
     }
-    # Normalize via Convert-Path to strip any PSDrive/provider prefix.
-    return (Convert-Path $best.FullName)
+
+    $sorted = $candidates | Sort-Object { $_.File.LastWriteTime } -Descending
+    $best = $sorted[0]
+
+    # Decide whether to prompt:
+    #   -Latest          -> never prompt
+    #   -Pick            -> always prompt
+    #   default          -> prompt if >1 candidate
+    $shouldPick = $false
+    if ($Pick)        { $shouldPick = $true }
+    elseif ($Latest)  { $shouldPick = $false }
+    elseif ($sorted.Count -gt 1) { $shouldPick = $true }
+
+    if (-not $shouldPick) {
+        return (Convert-Path $best.File.FullName)
+    }
+
+    Write-Host "Firmwares disponiveis (* = mais recente):" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        $c = $sorted[$i]
+        $marker = if ($i -eq 0) { "*" } else { " " }
+        $ts = $c.File.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+        $size = "{0,7:N0} KB" -f ([math]::Round($c.File.Length / 1KB))
+        Write-Host ("  [{0}] {1} {2} {3}  {4}  {5}" -f $i, $marker, $c.Source, $ts, $size, $c.File.Name)
+    }
+    $sel = Read-Host "Escolha o indice (Enter = 0 / mais recente)"
+    if (-not $sel) { $idx = 0 }
+    elseif ($sel -match '^\d+$' -and [int]$sel -lt $sorted.Count) { $idx = [int]$sel }
+    else { Write-Host "Selecao invalida." -ForegroundColor Red; exit 1 }
+
+    return (Convert-Path $sorted[$idx].File.FullName)
 }
 
 function Resolve-MergedBin {

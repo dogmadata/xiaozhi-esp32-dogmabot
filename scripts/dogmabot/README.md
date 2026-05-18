@@ -4,13 +4,48 @@ Scripts auxiliares para gravação e captura de log do firmware
 `xiaozhi-esp32-dogmabot` a partir do Windows (úteis especialmente em
 WSL, onde o `idf.py flash` não enxerga a porta serial diretamente).
 
+## `build.sh`
+
+Build interativo do firmware via docker (`espressif/idf:v5.5.2`).
+Rodar no WSL/Linux — wrapper de `scripts/release.py`.
+
+```bash
+cd ~/sources/ESP32/Firmware/xiaozhi-esp32-dogmabot/scripts/dogmabot
+./build.sh
+```
+
+O script lista os boards (os do DogmaBot — `sp-esp32-s3-1.28-box` e
+`waveshare/esp32-s3-rlcd-4.2` — aparecem no topo marcados com `*`),
+pergunta qual buildar (número ou nome, Enter = primeiro), oferece
+limpar `build/` + zips antigos do board, e roda o docker.
+
+Saídas:
+
+- `releases/v{ver}_{board}.zip` — pacote completo (merged-binary).
+- `build/xiaozhi.bin` — app only, use com `flash.ps1 -AppOnly`.
+- `build/merged-binary.bin` — full flash.
+
+Sobrescrever a imagem IDF (raro):
+
+```bash
+IDF_IMAGE=espressif/idf:v5.6 ./build.sh
+```
+
 ## `flash.ps1`
 
 Grava o `merged-binary.bin` (zip do release CI ou build local) na placa.
 
 ```powershell
-# Auto-descobre o .bin/.zip mais recente em releases/, build/ ou cwd.
+# Lista todos os candidatos (.bin/.zip em releases/, build/ e cwd) e
+# pergunta qual gravar. Enter usa o mais recente. Se só existe um, grava
+# direto sem perguntar.
 .\flash.ps1
+
+# Sempre perguntar (mesmo com 1 candidato):
+.\flash.ps1 -Pick
+
+# Sempre pegar o mais recente sem perguntar (comportamento antigo):
+.\flash.ps1 -Latest
 
 # Apaga a flash antes (recomendado na primeira vez ou após upgrade
 # de versão com layout de partição diferente):
