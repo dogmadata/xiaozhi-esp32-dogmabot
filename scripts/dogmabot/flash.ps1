@@ -175,10 +175,16 @@ function Resolve-MergedBin {
     return $Path
 }
 
-# App-only mode: skip merged-binary, flash just xiaozhi.bin at 0x20000.
-# Saves ~2/3 of the transfer when iterating on UI/code without touching the
-# bootloader, partition table or assets partition.
-$appOnlyBin = $null
+# App-only mode: skip merged-binary, flash just xiaozhi.bin at 0x20000
+# AND ota_data_initial.bin at 0xd000. The ota_data write is the part that
+# makes -AppOnly actually take effect: without it, if the device was last
+# OTA'd into the ota_1 slot, the bootloader keeps booting from ota_1 and
+# the freshly-flashed ota_0 sits unused. ota_data_initial.bin is just 8KB
+# of 0xFF (the "no OTA history" state) — writing it resets the slot
+# selection so the bootloader picks ota_0, where we just wrote. NVS at
+# 0x9000 (Wi-Fi, claim) is untouched.
+$appOnlyBin     = $null
+$appOnlyOtaData = $null
 if ($AppOnly) {
     if ($Bin) {
         if (-not (Test-Path $Bin)) {
@@ -195,7 +201,21 @@ if ($AppOnly) {
         }
         $appOnlyBin = (Convert-Path $appCandidate)
     }
+    # ota_data_initial.bin is always sourced from build/ — never from -Bin,
+    # since the user's -Bin points at xiaozhi.bin. Missing it is non-fatal
+    # (e.g. -Bin pointing at a standalone xiaozhi.bin outside any build/);
+    # we just warn and skip the slot reset.
+    $otaCandidate = Join-Path $RepoRoot "build\ota_data_initial.bin"
+    if (Test-Path $otaCandidate) {
+        $appOnlyOtaData = (Convert-Path $otaCandidate)
+    } else {
+        Write-Host "Aviso: build/ota_data_initial.bin nao encontrado. Pulo o reset do slot OTA." -ForegroundColor Yellow
+        Write-Host "  Se o device ja foi atualizado via OTA, o bootloader pode continuar no slot antigo." -ForegroundColor Yellow
+    }
     Write-Host "Usando (app only): $appOnlyBin" -ForegroundColor DarkGray
+    if ($appOnlyOtaData) {
+        Write-Host "  + reset ota_data: $appOnlyOtaData" -ForegroundColor DarkGray
+    }
 } else {
     $source = Find-Binary
     $mergedBin = Resolve-MergedBin -Path $source
@@ -237,11 +257,22 @@ if ($Erase) {
 }
 
 if ($AppOnly) {
-    Write-Host "Gravando xiaozhi.bin em 0x20000 (so a particao app)..." -ForegroundColor Cyan
-    & $py.Source -m esptool --chip esp32s3 -p $Port -b $Baud `
-        --before default_reset --after hard_reset write_flash `
-        --flash_mode dio --flash_size 16MB --flash_freq 80m `
-        0x20000 $appOnlyBin
+    $msg = if ($appOnlyOtaData) {
+        "Gravando xiaozhi.bin em 0x20000 + ota_data em 0xd000 (reset do slot OTA)..."
+    } else {
+        "Gravando xiaozhi.bin em 0x20000 (so a particao app)..."
+    }
+    Write-Host $msg -ForegroundColor Cyan
+    $espArgs = @(
+        '-m', 'esptool', '--chip', 'esp32s3', '-p', $Port, '-b', $Baud,
+        '--before', 'default_reset', '--after', 'hard_reset', 'write_flash',
+        '--flash_mode', 'dio', '--flash_size', '16MB', '--flash_freq', '80m',
+        '0x20000', $appOnlyBin
+    )
+    if ($appOnlyOtaData) {
+        $espArgs += @('0xd000', $appOnlyOtaData)
+    }
+    & $py.Source @espArgs
 } else {
     Write-Host "Gravando merged-binary em 0x0..." -ForegroundColor Cyan
     & $py.Source -m esptool --chip esp32s3 -p $Port -b $Baud `

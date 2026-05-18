@@ -77,7 +77,12 @@ install --user` na primeira vez se faltar.
 Por padrão o script grava o `merged-binary.bin`, que cobre todas as
 partições (bootloader, partition-table, ota_data, app, assets) a
 partir de `0x0` — ~9 MB. Com `-AppOnly`, grava apenas o
-`xiaozhi.bin` (~2.8 MB) diretamente em `0x20000` (`ota_0`):
+`xiaozhi.bin` (~2.8 MB) em `0x20000` (`ota_0`) **e** o
+`ota_data_initial.bin` (8 KB) em `0xd000`. A gravação do `ota_data`
+"rearma" o slot 0 como ativo — sem isso, se o device já tinha
+recebido um OTA do servidor e estava bootando do `ota_1`, o
+bootloader continuaria no slot antigo e suas mudanças locais não
+apareceriam. A NVS em `0x9000` (Wi-Fi, claim) fica intacta.
 
 ```powershell
 # Pega build/xiaozhi.bin do build local:
@@ -107,10 +112,11 @@ partir de `0x0` — ~9 MB. Com `-AppOnly`, grava apenas o
   `-AppOnly` preserva a partição NVS em `0x9000` (full flash
   zera a NVS porque o `merge_bin -f raw` preenche o gap entre
   partition-table e `ota_data` com `0xFF`).
-- Device foi atualizado via OTA e está rodando do slot `ota_1`:
-  `-AppOnly` grava em `ota_0`, então o boot continua no slot antigo.
-  Solução: rodar full flash uma vez para resetar `ota_data` para
-  `ota_0`.
+- Você passou `-Bin` apontando para um `xiaozhi.bin` fora de
+  `build/`: o reset de `ota_data` é pulado (com aviso). Se o device
+  tinha sido OTA'do, faça full flash uma vez. Quando você usa
+  `-AppOnly` sem `-Bin`, o `build/ota_data_initial.bin` é encontrado
+  automaticamente e o slot é resetado.
 
 **Limitações:**
 
