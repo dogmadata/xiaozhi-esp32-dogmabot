@@ -367,9 +367,13 @@ public:
     // with the time when the device is idle; here we suppress that and feed
     // the time into a dedicated clock_label_ at the top instead.
     virtual void UpdateStatusBar(bool update_all = false) override {
+        // Hold the LVGL lock across the base call AND our follow-up edits.
+        // Otherwise the base writes "HH:MM" into status_label_, releases its
+        // own lock, the LVGL task flushes one frame, and the clock briefly
+        // flashes over the emoji before we clear it below.
+        DisplayLockGuard lock(this);
         SpiLcdDisplay::UpdateStatusBar(update_all);
 
-        DisplayLockGuard lock(this);
         auto& board = Board::GetInstance();
         auto codec = board.GetAudioCodec();
 
